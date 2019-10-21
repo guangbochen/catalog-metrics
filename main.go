@@ -3,19 +3,18 @@ package main
 import (
 	"encoding/json"
 	"fmt"
-	"log"
 	"net/http"
 	"net/url"
 	"os"
+	"sort"
 	"strconv"
 	"time"
 
 	_ "github.com/influxdata/influxdb1-client" // this is important because of the bug in go mod
 	influxClient "github.com/influxdata/influxdb1-client"
+	"github.com/sirupsen/logrus"
+	"github.com/urfave/cli"
 )
-
-const httpRetries = 3
-var hc = &http.Client{Timeout: 10 * time.Second}
 
 type Repository struct {
 	Count int `json:"count"`
@@ -40,55 +39,92 @@ type Repo struct {
 	IsMigrated bool `json:"is_migrated"`
 }
 
-const baseRepoURL  = "https://hub.docker.com/v2/repositories/"
-const repoName = "ranchercharts"
+const (
+	baseRepoURL  = "https://hub.docker.com/v2/repositories/"
+	repoName = "ranchercharts"
+	VERSION = "0.1.0-dev"
+	httpRetries = 3
+
+)
+var hc = &http.Client{Timeout: 10 * time.Second}
 
 func main(){
+	app := cli.NewApp()
+	app.Name = "catalog-metrics"
+	app.Usage = "helps to collecting rancher catalog metrics"
+	app.Version = VERSION
+	app.Flags = []cli.Flag{
+		cli.BoolFlag{
+			Name: "debug",
+		},
+	}
+	app.Commands = []cli.Command{
+		{
+			Name:    "dockerhub",
+			Aliases: []string{"hub"},
+			Usage:   "run to collecting repository metrics of ranchercharts",
+			Action:  run,
+		},
+	}
+	sort.Sort(cli.FlagsByName(app.Flags))
+	sort.Sort(cli.CommandsByName(app.Commands))
+
+	if err := app.Run(os.Args); err != nil {
+		logrus.Fatal(err)
+	}
+
+}
+
+func run(c *cli.Context) error{
+	if c.Bool("debug") {
+		logrus.SetLevel(logrus.DebugLevel)
+	}
 	server := os.Getenv("INFLUX_SERVER")
 	port := os.Getenv("INFLUX_PORT")
 	if len(server) == 0 ||  len(port) == 0 {
-		log.Fatalf("both influxdb server and port is required, %s, %s", server, port)
+		return fmt.Errorf("influxdb server and port number is required, %s, %s", server, port)
 	}
 	portNum, err := strconv.ParseInt(port, 10, 32)
 	if err != nil {
-		log.Fatalf("%v", err.Error())
+		return err
 	}
 	conn, err := newInfluxDBClient(server, int(portNum))
 	if err != nil {
-		log.Fatalf("%v", err.Error())
+		return err
 	}
 
-	// get rancher/charts repository metadata from dockerHub and write into influxDB
+	// get ranchercharts repository metadata from dockerHub
+	var measure = "repositories"
 	repo, err := getRepositoryJson(baseRepoURL + repoName)
 	if err != nil {
-		fmt.Errorf("%v", err.Error())
+		return err
 	}
-	err = writeDataIntoInfluxDB(conn, *repo, "")
+	err = writeDataIntoInfluxDB(conn, *repo, measure)
 	if err != nil {
-		fmt.Errorf("%v", err.Error())
+		return err
 	}
 
-	// loop to get all of the repository by pagination link
+	// get all repository metadata by pagination link
 	for {
 		repo, err = getRepositoryJson(repo.Next)
 		if err != nil {
-			fmt.Errorf("%v", err.Error())
+			return err
 		}
-		fmt.Printf("%+v\n", repo)
 
-		err = writeDataIntoInfluxDB(conn, *repo, "")
+		err = writeDataIntoInfluxDB(conn, *repo, measure)
 		if err != nil {
-			fmt.Errorf("%v", err.Error())
+			return err
 		}
 
 		if repo.Next == "" {
 			break
 		}
 	}
+	return nil
 }
 
 func getRepositoryJson(url string) (*Repository, error) {
-	fmt.Println(url)
+	logrus.Infof("get repository metadata with url: %s", url)
 	failureInterval := 10 * time.Second
 	var repo = Repository{}
 	var err error
@@ -100,12 +136,21 @@ func getRepositoryJson(url string) (*Repository, error) {
 		}
 		resp, err := hc.Get(url)
 		if err != nil {
-			return nil, err
+			logrus.WithFields(logrus.Fields{
+				"attempt": retries + 1,
+				"error":   err,
+				"data":    url,
+			}).Warn("failed to retrieve metadata")
+			continue
 		}
 		err = json.NewDecoder(resp.Body).Decode(&repo)
 		if err != nil {
-			fmt.Printf("failed to get repository with err: %s, retry %d times\n", err.Error(), retries+1)
-			return nil, err
+			logrus.WithFields(logrus.Fields{
+				"attempt": retries + 1,
+				"error":   err,
+				"data":    resp.Body,
+			}).Warn("failed to decode metadata")
+			continue
 		}
 		resp.Body.Close()
 		if err == nil {
@@ -137,15 +182,16 @@ func newInfluxDBClient(endpoint string, port int) (*influxClient.Client, error) 
 
 func writeDataIntoInfluxDB(client *influxClient.Client, repo Repository, measure string) error{
 	if measure == "" {
-		measure = "repositories4"
+		measure = "repositories"
 	}
 	size := len(repo.Results)
 	pts  := make([]influxClient.Point, size)
 
+	logrus.Debugf("write data to the influxDB: %+v", repo.Results)
 	for i := 0; i < size; i++ {
 		repo := repo.Results[i]
 		pts[i] = influxClient.Point{
-			Measurement: "repositories3",
+			Measurement: measure,
 			Tags: map[string]string{
 				"name": repo.Name,
 				"namespace": repo.Namespace,
@@ -173,5 +219,9 @@ func writeDataIntoInfluxDB(client *influxClient.Client, repo Repository, measure
 		RetentionPolicy: "autogen",
 	}
 	_, err := client.Write(bps)
-	return err
+	if err != nil {
+		return err
+	}
+	logrus.Infof("success write %d data into the influxDB", len(repo.Results))
+	return nil
 }
