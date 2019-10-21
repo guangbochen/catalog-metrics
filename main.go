@@ -1,6 +1,7 @@
 package main
 
 import (
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -46,7 +47,9 @@ const (
 	httpRetries = 3
 
 )
-var hc = &http.Client{Timeout: 10 * time.Second}
+
+var tr = &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}
+var hc = &http.Client{ Timeout: 10 * time.Second, Transport: tr}
 
 func main(){
 	app := cli.NewApp()
@@ -94,13 +97,11 @@ func run(c *cli.Context) error{
 	}
 
 	// get ranchercharts repository metadata from dockerHub
-	var measure = "repositories"
 	repo, err := getRepositoryJson(baseRepoURL + repoName)
 	if err != nil {
 		return err
 	}
-	err = writeDataIntoInfluxDB(conn, *repo, measure)
-	if err != nil {
+	if err = writeDataIntoInfluxDB(conn, *repo); err != nil {
 		return err
 	}
 
@@ -111,8 +112,7 @@ func run(c *cli.Context) error{
 			return err
 		}
 
-		err = writeDataIntoInfluxDB(conn, *repo, measure)
-		if err != nil {
+		if err = writeDataIntoInfluxDB(conn, *repo); err != nil {
 			return err
 		}
 
@@ -172,6 +172,7 @@ func newInfluxDBClient(endpoint string, port int) (*influxClient.Client, error) 
 		URL:      *host,
 		Username: os.Getenv("INFLUX_USER"),
 		Password: os.Getenv("INFLUX_PWD"),
+		UnsafeSsl: true,
 	}
 	client, err := influxClient.NewClient(conf)
 	if err != nil {
@@ -180,18 +181,16 @@ func newInfluxDBClient(endpoint string, port int) (*influxClient.Client, error) 
 	return client, nil
 }
 
-func writeDataIntoInfluxDB(client *influxClient.Client, repo Repository, measure string) error{
-	if measure == "" {
-		measure = "repositories"
-	}
+func writeDataIntoInfluxDB(client *influxClient.Client, repo Repository) error{
 	size := len(repo.Results)
 	pts  := make([]influxClient.Point, size)
 
+	dbConfig := getInfluxDBConfig()
 	logrus.Debugf("write data to the influxDB: %+v", repo.Results)
 	for i := 0; i < size; i++ {
 		repo := repo.Results[i]
 		pts[i] = influxClient.Point{
-			Measurement: measure,
+			Measurement: dbConfig.Measure,
 			Tags: map[string]string{
 				"name": repo.Name,
 				"namespace": repo.Namespace,
@@ -210,12 +209,12 @@ func writeDataIntoInfluxDB(client *influxClient.Client, repo Repository, measure
 				"is_migrated": repo.IsMigrated,
 			},
 			Time:      time.Now(),
-			Precision: "ms",
+			Precision: "h",
 		}
 	}
 	bps := influxClient.BatchPoints{
 		Points:          pts,
-		Database:        "catalogtest",
+		Database:        dbConfig.DB,
 		RetentionPolicy: "autogen",
 	}
 	_, err := client.Write(bps)
@@ -224,4 +223,24 @@ func writeDataIntoInfluxDB(client *influxClient.Client, repo Repository, measure
 	}
 	logrus.Infof("success write %d data into the influxDB", len(repo.Results))
 	return nil
+}
+
+type InfluxDBConf struct {
+	DB string
+	Measure string
+}
+
+func getInfluxDBConfig() *InfluxDBConf {
+	var influx = &InfluxDBConf{}
+	measure := os.Getenv("INFLUXDB_MEASURE")
+	db := os.Getenv("INFLUXDB_NAME")
+
+	if len(measure) == 0 {
+		influx.Measure = "repositories"
+	}
+
+	if len(db) == 0 {
+		influx.DB = "catalog"
+	}
+	return influx
 }
